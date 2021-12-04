@@ -1,0 +1,204 @@
+%%
+%% $Revision $ 
+%% $RCSfile: sfun_coros_txqueue.tlc,v $
+%%
+%% Abstract:
+%%      TLC file for the CoROS Transmit.
+%%
+
+%implements "sfun_coros_txqueue" "C"
+
+
+%% Function: BlockTypeSetup ================================================
+%% Abstract:
+%%      
+%%      
+%function BlockTypeSetup(block, system) void
+
+%% ---------GENREATE H FILE--------------
+
+%assign hFileName = "CoROS_TxQueue_" + CompiledModel.Name
+%assign cmdproc_hFileName = "CoROS_CmdProc_" + CompiledModel.Name
+%openfile coros_hfile = "%<hFileName>.h"
+
+#ifndef COROS_TXQUEUE_H
+#define COROS_TXQUEUE_H
+
+//#include "%<LibGetMdlPubHdrBaseName()>.h"
+#include "%<cmdproc_hFileName>.h"
+
+
+#define COROS_TXRINGQUEUE_SIZE 50
+// FIFO Trasmit Queue
+typedef struct {
+    unsigned char ihead;
+    unsigned char itail;
+    unsigned char count; //0x0: Empty
+    unsigned char status; //0x0: Full 0x1: Not Full
+    const unsigned char size;
+    CoROS_RespMsg(* p_ring)[COROS_TXRINGQUEUE_SIZE];
+} CoROS_TXRingQueue;
+
+
+extern CoROS_TXRingQueue txRingQueue;
+CoROS_RtnCode getQueueSlot(CoROS_RespMsg** pp_respmsgslot);
+
+#endif
+%closefile coros_hfile
+
+%% ---------GENREATE H FILE END--------------
+
+%% ---------GENREATE C FILE--------------
+%assign cFileName = "CoROS_TxQueue_" + CompiledModel.Name
+%openfile coros_cfile = "%<cFileName>.cpp"
+
+#include <stdio.h>
+#include <cstdlib>
+#include <cstring>
+#include "%<hFileName>.h"
+////////////////////////////////////////////////////
+/*TX Ring Buffer Functions*/
+
+CoROS_RespMsg ringMsgArray[COROS_TXRINGQUEUE_SIZE];
+CoROS_TXRingQueue txRingQueue = {0, 0, 0, 1, COROS_TXRINGQUEUE_SIZE, &ringMsgArray};
+
+
+
+CoROS_RtnCode getQueueSlot(CoROS_RespMsg** pp_respmsgslot){
+    if(!txRingQueue.status){
+        printf("The transmit queue is full, loss of Tx Message may occur\n");
+        return COROS_NOK_TXQUEUEULL; //Queue is full, cannot accept new element
+    }
+    // head cursor
+    if(!txRingQueue.count) {}//if empty, doesnt need to increase head
+    else{
+       //increase head cursor, if reach end of array then roll back to beginning
+      if (txRingQueue.ihead < txRingQueue.size-1)
+      {
+        txRingQueue.ihead++;
+      } else
+      {
+          txRingQueue.ihead = 0;
+      }
+	    if (txRingQueue.ihead == txRingQueue.itail) {
+	    txRingQueue.status = 0x0;          // if full
+	    }
+    }
+    txRingQueue.count++;                 // add new element
+    *pp_respmsgslot = &((*txRingQueue.p_ring)[txRingQueue.ihead]);
+    return COROS_OK;
+}
+
+
+
+%closefile coros_cfile
+
+%% ---------GENREATE C FILE END--------------
+
+
+%<LibAddToCommonIncludes("%<hFileName>.h")>
+%<LibAddToModelSources("%<cFileName>")>
+
+
+%endfunction
+
+%% Function: BlockInstanceSetup ================================================
+%% Abstract:
+%%      Find and cache the needed Block records and names related to this block.
+%%      Generate warnings if I/O not connected. Cache an extern declaration to
+%%      the stopSem to provide graceful exit on overrun.
+%%
+%function BlockInstanceSetup(block, system) void
+
+  %% Get the Block for the downstream f-c ss, warn and return if there is none
+  %if LibIsEqual(SFcnSystemOutputCall.BlockToCall, "unconnected")
+    %assign wrnTxt = "The output for Task block '%<TaskName>' is " ...
+      "unconnected.  No code will be generated for this block."
+    %<LibReportWarning(wrnTxt)>
+    %return
+  %endif
+  %assign SSBlock = LibGetFcnCallBlock(block,0)
+  %addtorecord block ssBlock SSBlock
+
+
+%endfunction
+  
+%% Function: Start =============================================================
+%% Abstract:
+%%      Create semaphore and spawn the task function
+%%
+%function Start(block, system) Output
+
+%endfunction
+
+%% Function: Outputs ===========================================================
+%% Abstract:
+%%      Generate the intertask synchronization code. 
+%%
+%function Outputs(block, system) Output
+  %if !ISFIELD(block, "ssBlock")
+    %return
+  %endif
+  %assign respcode = LibBlockOutputSignal(1, "", "", 0)
+  %assign respstr = LibBlockOutputSignalAddr(2, "", "", 0)
+  %assign respstrlen = LibBlockOutputSignal(3, "", "", 0)
+  %assign respopt = LibBlockOutputSignalAddr(4, "", "", 0)
+  %% use last two elements(7,8@one based) of <resopt> to store current packet index and total number
+  %assign respopt7 = LibBlockOutputSignal(4, "", "", 6)
+  %assign respopt8 = LibBlockOutputSignal(4, "", "", 7)
+  %assign payloadptr = LibBlockOutputSignalAddr(5, "", "", 0)
+  %assign payloadlen = LibBlockOutputSignal(6, "", "", 0)
+
+    /*Process DAQ list and stuff DAQ messages with signal values*/
+    // Call DAQ processing function
+    if(coros_daq_enable){
+      processDAQList();
+      }
+    /*Transmit all response messages in the Tx Ring Queue*/
+    unsigned int coros_totalTxMsgCnt_step = txRingQueue.count;
+    while(txRingQueue.count>0)
+    {
+      printf("\n##TX QUEUE while{ # <Head: %u Tail: %u> Count:%u \n", txRingQueue.ihead, txRingQueue.itail, txRingQueue.count);
+      // Copy the content to tail message element, prepare publish port for transmit
+      %<respcode> = (*txRingQueue.p_ring)[txRingQueue.itail].respcode;
+      strcpy((char*)%<respstr>, (*txRingQueue.p_ring)[txRingQueue.itail].respstr);
+      %<respstrlen> = strlen((*txRingQueue.p_ring)[txRingQueue.itail].respstr);
+      memcpy(%<respopt>, (*txRingQueue.p_ring)[txRingQueue.itail].respoption, 8*sizeof(unsigned int)); // CoROS protocol: response option is unsigned int [8]
+      //%<respopt8> = txRingQueue.count-1; // 8th element of respoption: remaining message
+      //%<respopt7> = coros_totalTxMsgCnt_step; // 7th respoption: total number
+      %<payloadlen> = (*txRingQueue.p_ring)[txRingQueue.itail].datalen;
+      memcpy(%<payloadptr>, (*txRingQueue.p_ring)[txRingQueue.itail].pdata, %<payloadlen>);
+        %% Call the downstream f-c subsystem to publish the message
+      /* Call the system: '%<ssBlock.Name>' */
+      printf("##TX MSG# \tRESPCODE:0x%04X CMDSTR:%s\n\t\tRESPOPTION[0,1]: %u %u\n",
+            (*txRingQueue.p_ring)[txRingQueue.itail].respcode,
+            (*txRingQueue.p_ring)[txRingQueue.itail].respstr,
+            (*txRingQueue.p_ring)[txRingQueue.itail].respoption[0],
+            (*txRingQueue.p_ring)[txRingQueue.itail].respoption[1]
+      );
+      %<LibBlockExecuteFcnCall(block, 0)>    
+
+      // Remove transmitted message element from ring queue
+      txRingQueue.count--;
+      if(!txRingQueue.count) {}//if empty (tail meets head), tail cursor doesnt move
+      else{
+        if(txRingQueue.itail < txRingQueue.size-1){ //increase head cursor, if reach end of array then roll back to beginning
+            txRingQueue.itail++;
+        }else{
+            txRingQueue.itail = 0;
+        }
+      }
+    }
+
+
+%endfunction
+
+	
+%% Function: Terminate =========================================================
+%% Abstract:
+%%      Cleanup the RTOS Task
+%%
+%function Terminate(block, system) Output
+%endfunction
+
+%% [EOF] sfun_coros_txqueue.tlc
