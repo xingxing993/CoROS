@@ -310,14 +310,14 @@ classdef CoROSSignal < handle
                 p_nextCN = p_CN_Event+blocksize_cn+pad_cn;
                 % write time channel
                 writeCNBlock(fid, p_CN_Event, p_CC_Event, p_nextCN, ...
-                    true, 'EventTime', 'double', 8, 0, ... % varlength:8, startbyte:0
+                    true, 'CoROS_EventTime', 'double', 8, 0, ... % varlength:8, startbyte:0
                     0, false);
                 % write event signal channel
                 p_CN_Event = p_nextCN;
                 p_CC_Event = p_CC_Event + (blocksize_cc+pad_cc);
                 writeCCBlock(fid, p_CC_Event, '');
                 writeCNBlock(fid, p_CN_Event, p_CC_Event, 0, ...
-                    false, 'EventId', 'uint16', 2, 8, ... % varlength:2, startbyte:4
+                    false, 'CoROS_EventId', 'uint16', 2, 8, ... % varlength:2, startbyte:4
                     0, true);
                 writeDRBlock(fid, p_DR_Event, usreventdata, {'double', 'uint16'});
             else
