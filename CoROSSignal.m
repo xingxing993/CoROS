@@ -65,9 +65,6 @@ classdef CoROSSignal < handle
                 obj.BufferCount = 0;
             end
             obj.TempFileName = [getvalidname(obj.Name), '_', int2str(obj.Index)];
-            try
-                fclose(obj.FID);
-            end
             obj.FID = fopen(fullfile(obj.TempDirectory, obj.TempFileName), 'w+');
         end
 
@@ -173,7 +170,10 @@ classdef CoROSSignal < handle
             end
         end
 
-        function stopGroupRecording(objs)
+        function stopGroupRecording(objs, usreventlog)
+            if nargin<2
+                usreventlog = [];
+            end
             [objs.RecordingStopTime] = deal(now); %stop time
             for i=1:numel(objs)
                 objs(i).stopRecording; % the signal buffer should be finalized and rewind to head now
@@ -200,9 +200,9 @@ classdef CoROSSignal < handle
                 'Save as');
             if ~(isequal(filename,0) || isequal(pathname,0))
                 if filterindex==1
-                    sigobjs.saveToMDFFile(timearrays, fullfile(pathname, filename));
+                    sigobjs.saveToMDFFile(timearrays, usreventlog, fullfile(pathname, filename));
                 elseif filterindex==2
-                    sigobjs.saveToMatFile(timearrays, fullfile(pathname, filename));
+                    sigobjs.saveToMatFile(timearrays, usreventlog, fullfile(pathname, filename));
                 else
                 end
             end
@@ -240,13 +240,16 @@ classdef CoROSSignal < handle
         end
 
 
-        function saveToMDFFile(objs, timearrays, filename)
-            if nargin<3
+        function saveToMDFFile(objs, timearrays, usreventdata, filename)
+            if nargin<4
                 filename = sprintf('logfile_%s.dat', datestr(now, 30));
+            end
+            if nargin<3
+                usreventdata = [];
             end
             % input "objs" should be object array that contains exactly one time signal object (RawID==-1) at element 1
             fid = fopen(filename,'W');
-            numChannels = numel(objs); % RawID>0 to filter variable signal (time signal RawID==-1), and plus time signal
+            numChannels = numel(objs); % RawID>0 to filter variable signal (time signal RawID==-1)
             isTimeChannel = ([objs.RawID] == -1);
             numSamples = numel(timearrays(1).TimeData);
             varLens = [objs.ByteLength];
@@ -265,8 +268,8 @@ classdef CoROSSignal < handle
 
             % Basic pointer definition
             p_ID = 0;
-            p_HD = 64;
-            p_CC = 300;
+            p_HD = 64; % sizeof(IDBLOCK) = 64
+            p_CC = 300; % 
             blocksize_cc = 63;
             pad_cc = 2;
             p_CN = p_CC + numChannels*(blocksize_cc+pad_cc);
@@ -274,14 +277,54 @@ classdef CoROSSignal < handle
             pad_cn = 2;
             p_CG = p_CN + numChannels*(blocksize_cn+pad_cn);
             p_DG = p_CG + 50;
-            p_DT = p_DG + 50;
-            % init to char(0) for ID, HD, DG, CG, CNs, CCs
-            fwrite(fid, repmat(char(0), 1, p_DT), 'char');
+            if ~isempty(usreventdata)
+                numChannels_Event = 2; % {'time', 'event'}
+                numSamples_Event = size(usreventdata, 1);
+                varLens_Event = 8+2; % double + uint16
+                %use seperate channel group to store "User event logging signal"
+                p_CC_Event = p_DG+50;
+                p_CN_Event = p_CC_Event+(blocksize_cc+pad_cc)*numChannels_Event;
+                p_CG_Event = p_CN_Event+(blocksize_cn+pad_cn)*numChannels_Event;
+                p_DG_Event = p_CG_Event + 50;
+                p_DR_Event = p_DG_Event + 50;
+                lenEventDR = size(usreventdata, 1)*varLens_Event;
+                pad_dr_event = 80; % pad to create space in case of unexpected out of bounds
+                p_DR = p_DR_Event + lenEventDR + pad_dr_event;
+            else
+                p_DR = p_DG + 50;
+            end
 
+            % initialize to char(0) for ID, HD, DG, CG, CNs, CCs, and also Event DR as necessary
+            fwrite(fid, repmat(char(0), 1, p_DR), 'char');
+
+            % begin to write file
             writeIDBlock(fid, p_ID);
-            writeHDBlock(fid, p_HD, p_DG);
-            writeDGBlock(fid, p_DG, p_CG, p_DT);
-            writeCGBlock(fid, p_CG, p_CN, numChannels, numSamples, sum(varLens));
+            if ~isempty(usreventdata)
+                writeHDBlock(fid, p_HD, p_DG_Event, 2); % add another DG for User Event
+                writeDGBlock(fid, p_DG_Event, p_DG, p_CG_Event, p_DR_Event); % in this condition, the first DG should be the User Event channels
+                writeDGBlock(fid, p_DG, 0, p_CG, p_DR); % then link to the actual data group
+                writeCGBlock(fid, p_CG_Event, p_CN_Event, numChannels_Event, numSamples_Event, varLens_Event);
+                writeCGBlock(fid, p_CG, p_CN, numChannels, numSamples, sum(varLens));
+                %Event: CG-->(CN-->CC)*2
+                writeCCBlock(fid, p_CC_Event, '');
+                p_nextCN = p_CN_Event+blocksize_cn+pad_cn;
+                % write time channel
+                writeCNBlock(fid, p_CN_Event, p_CC_Event, p_nextCN, ...
+                    true, 'EventTime', 'double', 8, 0, ... % varlength:8, startbyte:0
+                    0, false);
+                % write event signal channel
+                p_CN_Event = p_nextCN;
+                p_CC_Event = p_CC_Event + (blocksize_cc+pad_cc);
+                writeCCBlock(fid, p_CC_Event, '');
+                writeCNBlock(fid, p_CN_Event, p_CC_Event, 0, ...
+                    false, 'EventId', 'uint16', 2, 8, ... % varlength:2, startbyte:4
+                    0, true);
+                writeDRBlock(fid, p_DR_Event, usreventdata, {'double', 'uint16'});
+            else
+                writeHDBlock(fid, p_HD, p_DG_Event, 1);
+                writeDGBlock(fid, p_DG, 0, p_CG, p_DR);
+                writeCGBlock(fid, p_CG, p_CN, numChannels, numSamples, sum(varLens)); % this should be the last CG
+            end
 
             startByte = 0;
             for index = 1 : numChannels
@@ -295,7 +338,7 @@ classdef CoROSSignal < handle
                 p_CN = p_CN+blocksize_cn+pad_cn;
             end
             
-            writeDRBlock(fid, p_DT, datamat_towrite, varTypes);
+            writeDRBlock(fid, p_DR, datamat_towrite, varTypes);
             fclose(fid);
         end
     end
@@ -323,7 +366,7 @@ function writeIDBlock(fid, offset)
 end
 
 
-function writeHDBlock(fid, offset, p_DG)
+function writeHDBlock(fid, offset, p_DG, numDG)
     blocksize = 164;
     fseek(fid,offset,'bof');        % file pointer always to 64 for HD
     fwrite(fid,char('HD'),'char');
@@ -331,7 +374,7 @@ function writeHDBlock(fid, offset, p_DG)
     fwrite(fid,p_DG,'uint32'); % Pointer to the first file group block (DGBLOCK) 
     fwrite(fid,0,'uint32');  % Pointer to the measurement file comment text (TXBLOCK), NIL #for now#
     fwrite(fid,0,'uint32');  % Pointer to program block (PRBLOCK), NIL #for now#
-    fwrite(fid,1,'uint16');  % number of DG
+    fwrite(fid,numDG,'uint16');  % number of DG
     fwrite(fid,datestr(now,'dd:mm:yyyy'),'char');
     fwrite(fid,datestr(now,'HH:MM:SS'),'char');
     username = getenv('USERNAME');
@@ -340,22 +383,22 @@ function writeHDBlock(fid, offset, p_DG)
     fwrite(fid, usrnamebuf, 'char');
     fwrite(fid, zeros(1,32,'uint8'),'char'); % Name of organization or department 
     strbuf32 = zeros(1,32,'uint8');
-    prjname = 'CoROS@xingxing993@gmail.com';
+    prjname = 'CoROS@jiangxinauto@163.com';
     strbuf32(1:numel(prjname)) = prjname;
     fwrite(fid, strbuf32,'char'); % Project name 
     fwrite(fid, zeros(1,32,'uint8'),'char'); % Measurement object e. g. the vehicle identification
 end
 
 
-function writeDGBlock(fid, offset, p_CG, p_DT)
+function writeDGBlock(fid, offset, p_nextDG, p_CG, p_DR)
     blocksize = 28;
     fseek(fid,offset,'bof');
     fwrite(fid,char('DG'),'2*char');
     fwrite(fid,blocksize,'uint16');
-    fwrite(fid,0,'uint32');     % Pointer to next data group block (DGBLOCK), only one #for now#
+    fwrite(fid,p_nextDG,'uint32');     % Pointer to next data group block (DGBLOCK)
     fwrite(fid,p_CG,'uint32');  % Pointer to next channel group block (CGBLOCK) 
     fwrite(fid,0,'uint32');     % Reserved
-    fwrite(fid,p_DT,'uint32');  % Pointer to the data records
+    fwrite(fid,p_DR,'uint32');  % Pointer to the data records
     fwrite(fid,1,'uint16');     % Number of channel groups (CGs)
     fwrite(fid,0,'uint16');     % data records without record ID
     fwrite(fid,0,'uint32');     % reserved
@@ -367,7 +410,7 @@ function writeCGBlock(fid, offset, p_CN, numChannels, numSamples, recordSize)
     fseek(fid,offset,'bof');
     fwrite(fid,char('CG'),'2*char');
     fwrite(fid,blocksize,'uint16');
-    fwrite(fid,0,'uint32');        % pointer to next CG, only one DAQ time, thus NIL #for now#
+    fwrite(fid,0,'uint32');        % pointer to next CG, only one DAQ time, and sorted storage
     fwrite(fid,p_CN,'uint32');     % pointer to next CN block
     fwrite(fid,0,'uint32');        % pointer to next TX block, NIL #for now#
     fwrite(fid,2,'uint16');        % recordID
@@ -408,8 +451,10 @@ function writeCNBlock(fid, offset, p_CC, p_nextCN, isTimeChannel, signalName, si
             signaldt_im = 0;
         case {'int32', 'int16', 'int8'}
             signaldt_im = 1;
-        case {'single', 'double'}
+        case {'single'}
             signaldt_im = 2;
+        case {'double'}
+            signaldt_im = 3;
         otherwise
             error('only data type double/single/uint32/uint16/uint8/int32/int16/int8 are supported.');
     end
@@ -447,12 +492,14 @@ end
 
 function writeDRBlock(fid, offset, DT, varTypes)
     fseek(fid,offset,'bof');
-    for row = 1:height(DT)
-        for col = 1:width(DT)
+    [nr,nc] = size(DT);
+    for row = 1:nr
+        for col = 1:nc
             fwrite(fid,DT(row,col),varTypes{col});
         end
     end
 end
+
 
 
 function varnames = getValidVariableNames(varnames)

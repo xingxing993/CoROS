@@ -9,6 +9,7 @@ uint32 respcode
 time timestamp
 
 
+
 # ---------------------------------
 
 string respstr
