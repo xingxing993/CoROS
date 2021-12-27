@@ -321,7 +321,7 @@ classdef CoROSSignal < handle
                     0, true);
                 writeDRBlock(fid, p_DR_Event, usreventdata, {'double', 'uint16'});
             else
-                writeHDBlock(fid, p_HD, p_DG_Event, 1);
+                writeHDBlock(fid, p_HD, p_DG, 1);
                 writeDGBlock(fid, p_DG, 0, p_CG, p_DR);
                 writeCGBlock(fid, p_CG, p_CN, numChannels, numSamples, sum(varLens)); % this should be the last CG
             end
